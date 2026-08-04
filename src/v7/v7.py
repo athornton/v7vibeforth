@@ -186,7 +186,7 @@ class V7:
         ):
             blk = 4 * 1024
             dxb = await asyncio.wait_for(self.reader.read(blk), timeout=tmout)
-            # The telnetlib3 typing is inconsistent.
+            # The telnetlib3 typing is inconsistent, hence the type:ignore.
             dx = (
                 dxb.decode()
                 if isinstance(dxb, bytes)  # type:ignore [redundant-expr]
@@ -206,6 +206,7 @@ class V7:
         self.logger.debug("expect", needles=needles)
         loop = asyncio.get_event_loop()
         end = loop.time() + timeout
+        try_again = True
         while True:
             besti = -1
             best = None
@@ -221,11 +222,19 @@ class V7:
                 self.logger.debug(
                     "expect", out=out, best=best, cut=cut, buf=self.buf
                 )
-                return best, out
+                # If we found the needle at the end of the buffer, assume
+                # we're done.  This might not be a safe assumption.
+                if self.buf == "" or not try_again:
+                    return best, out
             if loop.time() > end:
                 raise TimeoutError(f"want {needles}, buf='{self.buf}'")
             self.logger.debug("expect: reading more output")
+            saved_buf = self.buf
             await self._pump(min(2.0, end - loop.time()))
+            # If we get nothing more from the pump, assume we're done.
+            # This might not be a safe assumption.
+            if self.buf == saved_buf:
+                try_again = False
 
     async def send_slow(self, st: str, delay: float = 0.04) -> None:
         """Send a string character-by-character with a delay between each."""
