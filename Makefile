@@ -8,6 +8,7 @@ help:
 
 .PHONY: init
 init:
+	uv pip install --upgrade uv || pip install --upgrade uv
 	uv sync --frozen --all-groups
 	uv run prek install
 

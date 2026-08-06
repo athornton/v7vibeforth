@@ -55,6 +55,11 @@ nox = [
 typing = [
     "mypy>=1.19"
 ]
+dev = [
+    "nox",
+    "nox-uv",
+    "pytest"
+]
 
 [tool.black]
 line-length = 79
