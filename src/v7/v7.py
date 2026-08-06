@@ -136,6 +136,7 @@ class V7:
         self.reader: telnetlib3.TelnetReader | None = None
         self.writer: telnetlib3.TelnetWriter | None = None
         self.buf = ""
+        self._seq = 0  # serial number for cmd()'s framing marker
         self.logger = structlog.get_logger()
         self._set_debug_log()
         self.logger.debug("v7 instance initialized")
@@ -200,41 +201,44 @@ class V7:
     async def expect(
         self, needles: str | list[str], timeout: float = 60
     ) -> tuple[str, str]:
-        """Transmit and look for expected response."""
+        """Read until one of `needles` appears; return (needle, text).
+
+        Returns as soon as a needle matches, consuming everything up to and
+        including it.  Deciding whether a match is *really* the end of a
+        command is not something this can know -- see cmd(), which frames
+        commands with a unique marker instead of guessing.
+
+        When several needles match, the EARLIEST one in the stream wins:
+        for ["$ ", "# ", "incorrect"] a login failure has to be reported as
+        a failure even though a prompt turns up later in the buffer.
+        """
         if isinstance(needles, str):
             needles = [needles]
         self.logger.debug("expect", needles=needles)
         loop = asyncio.get_event_loop()
         end = loop.time() + timeout
-        try_again = True
         while True:
             besti = -1
             best = None
             for n in needles:
                 i = self.buf.find(n)
                 self.logger.debug("expect", needle=n, pos=i, besti=besti)
-                if i != -1 and i > besti:
+                if i != -1 and (besti == -1 or i < besti):
                     besti, best = i, n
             self.logger.debug("expect", best=best, pos=besti)
-            if best is not None and besti > -1:
+            if best is not None:
                 cut = besti + len(best)
                 out, self.buf = self.buf[:cut], self.buf[cut:]
                 self.logger.debug(
                     "expect", out=out, best=best, cut=cut, buf=self.buf
                 )
-                # If we found the needle at the end of the buffer, assume
-                # we're done.  This might not be a safe assumption.
-                if self.buf == "" or not try_again:
-                    return best, out
+                return best, out
             if loop.time() > end:
                 raise TimeoutError(f"want {needles}, buf='{self.buf}'")
             self.logger.debug("expect: reading more output")
-            saved_buf = self.buf
-            await self._pump(min(2.0, end - loop.time()))
-            # If we get nothing more from the pump, assume we're done.
-            # This might not be a safe assumption.
-            if self.buf == saved_buf:
-                try_again = False
+            # Floor the pump timeout: a non-positive wait_for() would fail
+            # instantly and spin the loop until the deadline.
+            await self._pump(min(2.0, max(0.05, end - loop.time())))
 
     async def send_slow(self, st: str, delay: float = 0.04) -> None:
         """Send a string character-by-character with a delay between each."""
@@ -280,15 +284,67 @@ class V7:
             return None
         return out
 
+    # Framing marker for cmd().  The command line we send never contains
+    # the joined string, because we send it as two echoes ("...MARK; echo
+    # <serial>") and the shell joins them only in the OUTPUT.  So the first
+    # occurrence of the joined marker is always the true end of output --
+    # never the tty's echo of the command itself.  (Same trick as _resync.)
+    _MARK = "V7xEOC"
+
     async def cmd(
         self, command: str, timeout: float = 120, prompt: str = "$ "
     ) -> str:
-        """Send command to remote v7 system and read reply."""
-        # This fails if there's the string '$ ' in the reply.  Fix that
-        # sometime.
+        """Send `command` to the remote system and return its output.
+
+        The shell prompt cannot be used to find the end of the output: '$ '
+        occurs in plenty of files (c/bedit.c has three), and any of them
+        would end the read early and leave the rest of the output in the
+        socket, where it would surface as the next command's output.  So we
+        append a marker command and read until the marker instead.
+
+        `prompt` is accepted for compatibility and used only as a fallback
+        if the marker never arrives.
+        """
         self.buf = ""
-        await self.send_slow(command + "\r")
-        _, out = await self.expect(prompt, timeout=timeout)
+        # Serial number keeps a stale marker from a timed-out earlier
+        # command from ending this one prematurely.
+        self._seq += 1
+        serial = f"{self._seq:04d}"
+        marker = self._MARK + serial
+        await self.send_slow(
+            f"{command}; echo -n {self._MARK}; echo {serial}\r"
+        )
+        try:
+            _, out = await self.expect(marker, timeout=timeout)
+        except TimeoutError:
+            # Marker never showed (command died, line dropped, or output
+            # stopped).  Fall back to the prompt so callers still get
+            # something, but leave the buffer alone for the caller to see.
+            self.logger.warning(
+                "cmd: marker not seen; falling back to prompt",
+                command=command,
+                marker=marker,
+            )
+            _, out = await self.expect(prompt, timeout=5)
+            return self._strip_frame(out, command, marker)
+        # The marker is immediately followed by "\r\n$ " from the shell.
+        # Consume it so it cannot pollute the next command's read.
+        await self.expect(prompt, timeout=10)
+        return self._strip_frame(out, command, marker)
+
+    def _strip_frame(self, out: str, command: str, marker: str) -> str:
+        """Remove the echoed command line and the trailing marker."""
+        # Drop everything up to and including the echo of our command line,
+        # so the caller sees output only.  The echo ends at the first
+        # newline after the command text.
+        idx = out.find(command)
+        if idx != -1:
+            nl = out.find("\n", idx + len(command))
+            if nl != -1:
+                out = out[nl + 1 :]
+        cut = out.rfind(marker)
+        if cut != -1:
+            out = out[:cut]
         return out
 
     async def put_lines(
@@ -530,32 +586,55 @@ class V7:
         return final == want_final
 
     async def _fetch(self, remote: str) -> str | None:
-        """Cat a remote text file and return just its contents: strip the
-        echoed command line, the trailing shell prompt, and CRs.  Returns
-        None on an obvious error (no such file).
+        """Cat a remote text file and return just its contents.
+
+        Returns None if the file cannot be read.  Readability is decided by
+        `test -f`, NOT by scanning the body for error text: c/bedit.c
+        contains the string "not found" twice, and the old content scan made
+        that file (and any other file that discusses errors) impossible to
+        download.
+
+        Two v7 quirks drive the odd-looking command:
+          * v7's `cat` exits 0 even when it cannot open the file, so cat's
+            own status is useless -- verified on the machine.  `test -f`
+            does report correctly.
+          * `$?` refers to the immediately preceding command, so the status
+            must be saved to a variable BEFORE the marker echo runs.
         """
         self.logger.debug("Fetching file", file=remote)
-        raw = await self.cmd("cat " + remote)
-        raw = raw.replace("\r", "")
-        lines = raw.split("\n")
-        # first line is the echoed 'cat <remote>' command; drop it
-        if lines and lines[0].strip().startswith("cat " + remote):
-            lines = lines[1:]
-        # last line is the shell prompt ('$ ' / '# '); drop it
-        if lines and lines[-1].rstrip() in ("$", "#", ""):
-            lines = lines[:-1]
-        body = "\n".join(lines)
-        if (
-            "can't open" in body
-            or "cannot open" in body
-            or "No such" in body
-            or "not found" in body
-        ):
-            self.logger.error("remote error", body=body.strip())
+        # cmd() already strips its own echoed command line and end marker,
+        # so what comes back is the file contents (with CRs from the tty).
+        # Don't strip a leading 'cat <remote>' line here as well: after the
+        # marker fix that line is gone, and a file whose own first line
+        # happened to look like the command would lose it.
+        #
+        # The status is prefixed with the same split marker cmd() uses, so
+        # the file contents cannot forge it: the joined string only ever
+        # appears in the shell's OUTPUT, never in the command we send.
+        tag = self._MARK + "rc"
+        raw = await self.cmd(
+            f"test -f {remote}; s=$?; cat {remote}"
+            f"; echo -n {self._MARK}; echo rc$s"
+        )
+        body = raw.replace("\r", "")
+        head, found, rest = body.rpartition(tag)
+        if not found:
+            # No status marker: something ate the framing.  Don't silently
+            # hand back a possibly-truncated file.
+            self.logger.error(
+                "fetch: status marker missing", file=remote, bytes=len(body)
+            )
+            return None
+        body = head
+        code = rest.strip()
+        if code != "0":
+            self.logger.error(
+                "remote error: file not readable", file=remote, status=code
+            )
             return None
         if body and not body.endswith("\n"):
             body += "\n"
-        self.logger.debug("File fetched", body=body)
+        self.logger.debug("File fetched", bytes=len(body))
         return body
 
     async def check(
