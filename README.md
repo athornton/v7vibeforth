@@ -216,7 +216,7 @@ That's large in v7 terms:
 | ed      | 11074        |
 | f77     | 11340        |
 | sed     | 12876        |
-| *forth* | *15394*      |
+| *forth* | *15596*      |
 | sh      | 17310        |
 | adb     | 34652        |
 | troff   | 41666        |

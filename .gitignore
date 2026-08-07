@@ -145,5 +145,8 @@ dmypy.json
 *.tap
 
 # built binaries
-bedit
-forth
+c/bedit
+c/forth
+
+# forth buffers
+blocks

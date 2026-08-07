@@ -81,6 +81,11 @@ class V7Server:
     # Set to drop the connection the next time the shell writes anything,
     # so the reconnect path in _resync() can be tested.
     drop_next_write: bool = False
+    # Number of `cat > file` uploads to swallow WITHOUT ever echoing the
+    # closing prompt.  This is what a wedged tty looks like from the
+    # client's side: input is accepted, nothing comes back.  Counts down,
+    # so wedge_uploads=1 stalls the first chunk and lets the retry succeed.
+    wedge_uploads: int = 0
 
     async def start(self) -> None:
         """Listen on an ephemeral port; sets self.port."""
@@ -241,6 +246,21 @@ class V7Server:
         append: bool,
     ) -> None:
         """Consume echoed input into `target` until ^D, as v7's cat does."""
+        if self.wedge_uploads > 0:
+            # Simulate a wedged tty: keep accepting input but NEVER answer,
+            # not even after the ^D that ends the cat.  The prompt the
+            # client is waiting for never arrives, so its expect() times
+            # out -- which is how the real machine failed.  Staying silent
+            # past the ^D is the whole point: returning here would let the
+            # session loop print a prompt and the client would recover for
+            # the wrong reason.
+            self.wedge_uploads -= 1
+            self.files[target] = "<wedged: incomplete>"
+            while True:
+                ch = await reader.read(1)
+                if not ch:
+                    return
+                # swallow everything, including ^D, and answer nothing
         body = ""
         seen_cr = False
         while True:

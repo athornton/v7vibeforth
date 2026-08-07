@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import shlex
+import statistics
 from dataclasses import dataclass
 from getpass import getpass
 from pathlib import Path
@@ -81,6 +82,10 @@ class V7:
         ),
         V7verb(
             "host",
+            arity=1,
+        ),
+        V7verb(
+            "user",
             arity=1,
         ),
         V7verb(
@@ -315,8 +320,16 @@ class V7:
     # be cheap -- 100 characters is ~0.11 s at 9600 baud, ~3.3 s at 300.
     PROBE_CHARS: ClassVar[int] = 100
 
+    # How many probes to take, reporting the MEDIAN.  A single probe is not
+    # good enough: on a loaded host, repeated probes of the same 9600-baud
+    # line have been observed spanning 7375-10500 (a 42% spread), and one
+    # unlucky high reading is all it takes to snap to 19200 and then pace
+    # uploads at twice the line's real speed -- the direction that corrupts
+    # data.  The median of an odd number of samples throws out both tails.
+    PROBE_TRIES: ClassVar[int] = 5
+
     async def measure_line_rate(self) -> float | None:
-        """Time a known-length reply to derive the line speed, in baud.
+        """Derive the line speed in baud, as the median of several probes.
 
         Telnet cannot tell us this.  RFC 1079 TSPEED is a *client's* hint
         about its own terminal, and simh does not negotiate it at all: it
@@ -329,15 +342,42 @@ class V7:
         line, so output arrives one character at a time, each one costing a
         full character time on the wire -- measured median inter-byte gap
         on the 9600-baud DZ11 was 1.027 ms against a theoretical 1.042 ms.
-        Timing a reply of known length therefore recovers the rate to a few
-        percent, and works on anything from a 300-baud console to a real
-        PDP-11 behind a serial gateway.
 
-        Returns the estimate in baud, or None if it could not be measured
-        (in which case self.baud is left alone).
+        A SINGLE probe is not trustworthy: on a loaded host, repeated probes
+        of the same 9600-baud line have come back anywhere from 7375 to
+        10500 baud, and one high outlier is enough to snap to 19200 and
+        then pace every upload at twice the line's real speed.  So take
+        PROBE_TRIES samples and report the median, which discards both
+        tails.
+
+        Returns the estimate in baud, or None if nothing could be measured
+        (in which case the caller leaves self.baud alone).
         """
         if self.writer is None:
             self._write_error()
+            return None
+        samples = []
+        for _ in range(self.PROBE_TRIES):
+            one = await self._probe_line_rate()
+            if one is not None:
+                samples.append(one)
+        if not samples:
+            self.logger.warning(
+                "could not measure line rate; keeping current value",
+                baud=self.baud,
+            )
+            return None
+        baud = statistics.median(samples)
+        self.logger.debug(
+            "measured line rate",
+            samples=[round(s) for s in samples],
+            median=round(baud),
+        )
+        return baud
+
+    async def _probe_line_rate(self) -> float | None:
+        """One timing probe: echo a known payload and time its arrival."""
+        if self.writer is None:
             return None
         payload = "x" * self.PROBE_CHARS
         self.buf = ""
@@ -366,21 +406,13 @@ class V7:
         await self._drain(0.4, 5.0)
         self.buf = ""
         if seen < self.PROBE_CHARS // 2 or span <= 0:
-            self.logger.warning(
-                "could not measure line rate; keeping current value",
+            self.logger.debug(
+                "line-rate probe produced nothing usable",
                 chars=seen,
                 span=round(span, 4),
-                baud=self.baud,
             )
             return None
-        baud = seen / span * self.BITS_PER_CHAR
-        self.logger.debug(
-            "measured line rate",
-            chars=seen,
-            span=round(span, 4),
-            baud=round(baud),
-        )
-        return baud
+        return seen / span * self.BITS_PER_CHAR
 
     # Standard serial rates.  A measurement lands a few percent off, so it
     # is snapped to the nearest of these -- both to report something
@@ -629,21 +661,30 @@ class V7:
     def line_pace(self, line: str) -> float:
         """How long to wait after bursting `line` into a `cat > file`.
 
-        The tty has to echo every character back, and the echo is what
-        actually costs time: writing a 60-character line takes no time at
-        all locally, but the far end needs 60 character times to echo it.
-        Waiting less means the echo backs up in the tty queue and, under
-        sustained load, the line drops mid-upload.  So the pause scales
-        with the line's LENGTH, not with a fixed constant -- which is what
-        made the old hardcoded 0.02 s wrong at any speed but 9600.
-        """
-        return len(line) * self.char_time * self.ECHO_HEADROOM
+        The tty echoes every character back, and that echo is what costs
+        time: writing a 60-character line takes no time at all locally, but
+        the far end needs 60 character times (plus CR and LF) to echo it.
+        The pause therefore scales with the line's LENGTH and the line's
+        SPEED -- a fixed constant is wrong at every rate but the one it was
+        tuned for.
 
-    # How much of the echo time to actually wait.  1.0 would be exact; less
-    # relies on the tty queue absorbing the slack (it holds a few hundred
-    # characters).  0.5 was measured to be reliable at 9600 while running
-    # about twice as fast as waiting for the full echo.
-    ECHO_HEADROOM: ClassVar[float] = 0.5
+        The wait must cover the WHOLE echo, not a fraction of it.  Anything
+        less leaves a per-line deficit that accumulates: at 9600 baud a
+        60-line chunk of forth.c needs ~2960 ms of echo but a half-echo
+        wait supplies only ~1420 ms, leaving ~1480 characters of backlog
+        per chunk.  The DZ11's silo cannot hold that, so it compounds until
+        the line wedges -- reliably around chunk 20 of forth.c.
+        """
+        # +2 for the CR/LF the tty echoes at the end of the line.
+        return (len(line) + 2) * self.char_time * self.ECHO_HEADROOM
+
+    # Multiplier on the measured echo time.  Must be >= 1.0: the echo has
+    # to finish, and the only question is how much margin to add on top for
+    # the far end's own scheduling (simh services the DZ11 from a single
+    # core, so echo can lag its theoretical rate).  1.0 exactly was tried
+    # and is NOT enough in practice; 1.25 restores the safety margin the
+    # old hardcoded 0.02 s happened to provide for typical source lines.
+    ECHO_HEADROOM: ClassVar[float] = 1.25
 
     async def _cat_chunk(
         self, remote: str, lines: list[str], pace: float | None = None
@@ -757,9 +798,29 @@ class V7:
                 try:
                     await self._cat_chunk(tmp, clines, cpace)
                     got = await self._remote_sum(tmp)
-                except RuntimeError as e:
-                    self.logger.exception("put_verified")
-                    reason = str(e)
+                # A wedged line shows up two ways and BOTH are retryable:
+                # _cat_chunk raises RuntimeError when it sees 'login:' in
+                # the echo, but if the far end simply stops answering we
+                # instead get a TimeoutError out of expect().  TimeoutError
+                # is an OSError, NOT a RuntimeError, so catching only
+                # RuntimeError let it escape past _resync() and abort the
+                # whole upload -- which is exactly the crash this retry
+                # loop exists to prevent.  ConnectionError/EOFError are
+                # included for the same reason: they mean "line is sick",
+                # and the answer to that is _resync(), not a traceback.
+                except (
+                    RuntimeError,
+                    TimeoutError,
+                    ConnectionError,
+                    EOFError,
+                ) as e:
+                    self.logger.warning(
+                        "put_verified: chunk failed, will retry",
+                        chunk=ci + 1,
+                        attempt=attempt + 1,
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    reason = f"{type(e).__name__}: {e}"
                 else:
                     reason = "sum mismatch" if got != want else "ok"
                 status = "ok" if got == want else reason
