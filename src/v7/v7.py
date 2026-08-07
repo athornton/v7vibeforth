@@ -84,6 +84,10 @@ class V7:
             arity=1,
         ),
         V7verb(
+            "user",
+            arity=1,
+        ),
+        V7verb(
             "port",
             arity=1,
         ),
