@@ -629,21 +629,30 @@ class V7:
     def line_pace(self, line: str) -> float:
         """How long to wait after bursting `line` into a `cat > file`.
 
-        The tty has to echo every character back, and the echo is what
-        actually costs time: writing a 60-character line takes no time at
-        all locally, but the far end needs 60 character times to echo it.
-        Waiting less means the echo backs up in the tty queue and, under
-        sustained load, the line drops mid-upload.  So the pause scales
-        with the line's LENGTH, not with a fixed constant -- which is what
-        made the old hardcoded 0.02 s wrong at any speed but 9600.
-        """
-        return len(line) * self.char_time * self.ECHO_HEADROOM
+        The tty echoes every character back, and that echo is what costs
+        time: writing a 60-character line takes no time at all locally, but
+        the far end needs 60 character times (plus CR and LF) to echo it.
+        The pause therefore scales with the line's LENGTH and the line's
+        SPEED -- a fixed constant is wrong at every rate but the one it was
+        tuned for.
 
-    # How much of the echo time to actually wait.  1.0 would be exact; less
-    # relies on the tty queue absorbing the slack (it holds a few hundred
-    # characters).  0.5 was measured to be reliable at 9600 while running
-    # about twice as fast as waiting for the full echo.
-    ECHO_HEADROOM: ClassVar[float] = 0.5
+        The wait must cover the WHOLE echo, not a fraction of it.  Anything
+        less leaves a per-line deficit that accumulates: at 9600 baud a
+        60-line chunk of forth.c needs ~2960 ms of echo but a half-echo
+        wait supplies only ~1420 ms, leaving ~1480 characters of backlog
+        per chunk.  The DZ11's silo cannot hold that, so it compounds until
+        the line wedges -- reliably around chunk 20 of forth.c.
+        """
+        # +2 for the CR/LF the tty echoes at the end of the line.
+        return (len(line) + 2) * self.char_time * self.ECHO_HEADROOM
+
+    # Multiplier on the measured echo time.  Must be >= 1.0: the echo has
+    # to finish, and the only question is how much margin to add on top for
+    # the far end's own scheduling (simh services the DZ11 from a single
+    # core, so echo can lag its theoretical rate).  1.0 exactly was tried
+    # and is NOT enough in practice; 1.25 restores the safety margin the
+    # old hardcoded 0.02 s happened to provide for typical source lines.
+    ECHO_HEADROOM: ClassVar[float] = 1.25
 
     async def _cat_chunk(
         self, remote: str, lines: list[str], pace: float | None = None
@@ -757,9 +766,29 @@ class V7:
                 try:
                     await self._cat_chunk(tmp, clines, cpace)
                     got = await self._remote_sum(tmp)
-                except RuntimeError as e:
-                    self.logger.exception("put_verified")
-                    reason = str(e)
+                # A wedged line shows up two ways and BOTH are retryable:
+                # _cat_chunk raises RuntimeError when it sees 'login:' in
+                # the echo, but if the far end simply stops answering we
+                # instead get a TimeoutError out of expect().  TimeoutError
+                # is an OSError, NOT a RuntimeError, so catching only
+                # RuntimeError let it escape past _resync() and abort the
+                # whole upload -- which is exactly the crash this retry
+                # loop exists to prevent.  ConnectionError/EOFError are
+                # included for the same reason: they mean "line is sick",
+                # and the answer to that is _resync(), not a traceback.
+                except (
+                    RuntimeError,
+                    TimeoutError,
+                    ConnectionError,
+                    EOFError,
+                ) as e:
+                    self.logger.warning(
+                        "put_verified: chunk failed, will retry",
+                        chunk=ci + 1,
+                        attempt=attempt + 1,
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    reason = f"{type(e).__name__}: {e}"
                 else:
                     reason = "sum mismatch" if got != want else "ok"
                 status = "ok" if got == want else reason
