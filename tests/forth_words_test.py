@@ -17,6 +17,7 @@ Runnable two ways:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -82,18 +83,172 @@ def run_forth(src: str, *, timeout: float = 20.0) -> str:
     binary = forth_binary()
     if not src.endswith("\n"):
         src += "\n"
-    proc = subprocess.run(
-        [binary],
-        input=src,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-        # Run somewhere harmless: the interpreter opens ./blocks on demand.
-        cwd=tempfile.gettempdir(),
-        env={**os.environ, "TERM": "dumb"},
-    )
+    with tempfile.TemporaryDirectory(prefix="forthrun") as workdir:
+        proc = subprocess.run(
+            [binary],
+            input=src,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            # A fresh directory each time: the interpreter creates ./blocks
+            # on demand, and the block tests write to it.
+            cwd=workdir,
+            env={**os.environ, "TERM": "dumb"},
+        )
     return proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------------
+# the .fth test files: whole-word-set coverage
+# --------------------------------------------------------------------
+
+FORTH_DIR = Path(__file__).parent / "forth"
+PRELUDE = FORTH_DIR / "prelude.fth"
+
+
+def chunk_files() -> list[Path]:
+    """Return the numbered test files, in order."""
+    return sorted(
+        p for p in FORTH_DIR.glob("*.fth") if p.name != "prelude.fth"
+    )
+
+
+def run_chunk(chunk: Path, *, timeout: float = 60.0) -> str:
+    """Run one .fth file with the assertion prelude in front of it."""
+    src = PRELUDE.read_text() + chunk.read_text()
+    return run_forth(src, timeout=timeout)
+
+
+@pytest.mark.parametrize("chunk", chunk_files(), ids=lambda p: p.stem)
+def test_forth_chunk_passes(chunk: Path) -> None:
+    """Every assertion in every .fth file must pass.
+
+    Each file ends with REPORT, which prints a tests=/failed= line and then
+    either ALL-OK or HAVE-FAILURES, so one grep tells us the verdict and the
+    *** FAIL lines name the individual checks that broke.
+    """
+    out = run_chunk(chunk)
+    assert "ALL-OK" in out, f"{chunk.name} reported failures:\n" + "\n".join(
+        ln
+        for ln in out.splitlines()
+        if "FAIL" in ln or "tests=" in ln or "?" in ln
+    )
+
+
+@pytest.mark.parametrize("chunk", chunk_files(), ids=lambda p: p.stem)
+def test_forth_chunk_has_no_unknown_words(chunk: Path) -> None:
+    """A mistyped or missing word prints `<name> ?` -- catch that too.
+
+    Without this a file could "pass" while silently skipping half its
+    checks, because an unrecognised word is reported and then ignored
+    rather than aborting the run.
+    """
+    out = run_chunk(chunk)
+    unknown = [
+        ln.strip()
+        for ln in out.splitlines()
+        if ln.strip().endswith(" ?") or ln.strip() == "?"
+    ]
+    assert not unknown, (
+        f"{chunk.name} used words the interpreter does not know: {unknown}"
+    )
+
+
+@pytest.mark.parametrize(
+    "chunk", [PRELUDE, *chunk_files()], ids=lambda p: p.stem
+)
+def test_comments_are_period_correct(chunk: Path) -> None:
+    r"""Comments must use ( ... ), the only form Forth-78/79 has.
+
+    The `\` comment is a Forth-83/ANS addition (and a gforth habit).  This
+    interpreter does implement it, but these files are meant to be readable
+    as period-correct Forth, so the parenthesised form is the house style.
+
+    Two things to remember when editing them: `(` is a WORD, so it needs a
+    space after it -- `(comment)` is silently parsed as code -- and the
+    comment ends at the first `)` on the SAME line, because this
+    interpreter's `(` does not span lines.
+    """
+    # A backslash is only a COMMENT when it starts a line or follows
+    # whitespace with more text after it.  `FIND \` names the word itself,
+    # which 11-misc.fth does deliberately to exercise it, so allow that.
+    offenders = []
+    for n, ln in enumerate(chunk.read_text().splitlines(), start=1):
+        for m in re.finditer(r"(?:^|\s)\\(?:\s|$)", ln):
+            before = ln[: m.start()].split()
+            if before and before[-1] in ("FIND", "'", "[COMPILE]"):
+                continue  # naming the word, not commenting with it
+            offenders.append(f"{n}: {ln.strip()}")
+            break
+    assert not offenders, (
+        f"{chunk.name} uses the Forth-83/ANS '\\' comment; Forth-78/79 has "
+        f"only ( ... ):\n  " + "\n  ".join(offenders)
+    )
+
+
+@pytest.mark.parametrize(
+    "chunk", [PRELUDE, *chunk_files()], ids=lambda p: p.stem
+)
+def test_open_paren_is_followed_by_a_space(chunk: Path) -> None:
+    """`( ` needs the space: `(text)` parses as code and is silently wrong."""
+    bad = [
+        f"{n}: {ln.strip()}"
+        for n, ln in enumerate(chunk.read_text().splitlines(), start=1)
+        if re.search(r"\((?![ )])", ln)
+    ]
+    assert not bad, (
+        f"{chunk.name} has a '(' not followed by a space, which the "
+        f"interpreter reads as a word rather than a comment:\n  "
+        + "\n  ".join(bad)
+    )
+
+
+def defined_words() -> set[str]:
+    """Every word name c/forth.c registers, from the source itself."""
+    src = SOURCE.read_text()
+    pattern = r'(?:prim|dprim|immprim|immdprim|vari)\("((?:[^"\\]|\\.)*)"'
+    return {
+        name.replace('\\"', '"').replace("\\\\", "\\")
+        for name in re.findall(pattern, src)
+    }
+
+
+# Runtime words with no user-facing syntax: they exist only as the compiled
+# body of a control structure or literal, planted by the compiler.  They are
+# exercised indirectly every time a loop, string or literal runs, and cannot
+# be typed at the interpreter, so they are exempt from the coverage check.
+INTERNAL_ONLY = {
+    "(+LOOP)",
+    '(.")',
+    "(DO)",
+    "(DOES>)",
+    "(LOOP)",
+    "0BRANCH",
+    "BRANCH",
+    "EXIT",
+    "LIT",
+}
+
+
+def test_every_defined_word_is_exercised() -> None:
+    """The point of the suite: no word ships without a test.
+
+    Compares the words c/forth.c registers against the text of the .fth
+    files, so adding a word without testing it fails here.
+    """
+    text = "".join(p.read_text() for p in chunk_files())
+    tokens = set(text.split())
+    missing = sorted(
+        w
+        for w in defined_words()
+        if w not in INTERNAL_ONLY and w not in tokens and w not in text
+    )
+    assert not missing, (
+        f"{len(missing)} defined word(s) appear in no test file: {missing}.\n"
+        "Add them to the appropriate tests/forth/*.fth group, or to "
+        "INTERNAL_ONLY if they are compiler-planted runtime words."
+    )
 
 
 # --------------------------------------------------------------------
@@ -263,9 +418,23 @@ def _main() -> int:
             cases = list(DOUBLE_CASES)
         elif name == "test_existing_words_still_work":
             cases = list(REGRESSION_CASES)
+        elif name in (
+            "test_forth_chunk_passes",
+            "test_forth_chunk_has_no_unknown_words",
+        ):
+            cases = [(p,) for p in chunk_files()]
+        elif name in (
+            "test_comments_are_period_correct",
+            "test_open_paren_is_followed_by_a_space",
+        ):
+            # these also check the prelude itself
+            cases = [(p,) for p in [PRELUDE, *chunk_files()]]
         for args in cases:
             ran += 1
-            label = f"{name}{args or ''}"
+            shown = (
+                args[0].stem if args and isinstance(args[0], Path) else args
+            )
+            label = f"{name}{f'[{shown}]' if args else ''}"
             try:
                 fn(*args)
             except AssertionError as e:

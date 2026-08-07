@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import shlex
+import statistics
 from dataclasses import dataclass
 from getpass import getpass
 from pathlib import Path
@@ -319,8 +320,16 @@ class V7:
     # be cheap -- 100 characters is ~0.11 s at 9600 baud, ~3.3 s at 300.
     PROBE_CHARS: ClassVar[int] = 100
 
+    # How many probes to take, reporting the MEDIAN.  A single probe is not
+    # good enough: on a loaded host, repeated probes of the same 9600-baud
+    # line have been observed spanning 7375-10500 (a 42% spread), and one
+    # unlucky high reading is all it takes to snap to 19200 and then pace
+    # uploads at twice the line's real speed -- the direction that corrupts
+    # data.  The median of an odd number of samples throws out both tails.
+    PROBE_TRIES: ClassVar[int] = 5
+
     async def measure_line_rate(self) -> float | None:
-        """Time a known-length reply to derive the line speed, in baud.
+        """Derive the line speed in baud, as the median of several probes.
 
         Telnet cannot tell us this.  RFC 1079 TSPEED is a *client's* hint
         about its own terminal, and simh does not negotiate it at all: it
@@ -333,15 +342,42 @@ class V7:
         line, so output arrives one character at a time, each one costing a
         full character time on the wire -- measured median inter-byte gap
         on the 9600-baud DZ11 was 1.027 ms against a theoretical 1.042 ms.
-        Timing a reply of known length therefore recovers the rate to a few
-        percent, and works on anything from a 300-baud console to a real
-        PDP-11 behind a serial gateway.
 
-        Returns the estimate in baud, or None if it could not be measured
-        (in which case self.baud is left alone).
+        A SINGLE probe is not trustworthy: on a loaded host, repeated probes
+        of the same 9600-baud line have come back anywhere from 7375 to
+        10500 baud, and one high outlier is enough to snap to 19200 and
+        then pace every upload at twice the line's real speed.  So take
+        PROBE_TRIES samples and report the median, which discards both
+        tails.
+
+        Returns the estimate in baud, or None if nothing could be measured
+        (in which case the caller leaves self.baud alone).
         """
         if self.writer is None:
             self._write_error()
+            return None
+        samples = []
+        for _ in range(self.PROBE_TRIES):
+            one = await self._probe_line_rate()
+            if one is not None:
+                samples.append(one)
+        if not samples:
+            self.logger.warning(
+                "could not measure line rate; keeping current value",
+                baud=self.baud,
+            )
+            return None
+        baud = statistics.median(samples)
+        self.logger.debug(
+            "measured line rate",
+            samples=[round(s) for s in samples],
+            median=round(baud),
+        )
+        return baud
+
+    async def _probe_line_rate(self) -> float | None:
+        """One timing probe: echo a known payload and time its arrival."""
+        if self.writer is None:
             return None
         payload = "x" * self.PROBE_CHARS
         self.buf = ""
@@ -370,21 +406,13 @@ class V7:
         await self._drain(0.4, 5.0)
         self.buf = ""
         if seen < self.PROBE_CHARS // 2 or span <= 0:
-            self.logger.warning(
-                "could not measure line rate; keeping current value",
+            self.logger.debug(
+                "line-rate probe produced nothing usable",
                 chars=seen,
                 span=round(span, 4),
-                baud=self.baud,
             )
             return None
-        baud = seen / span * self.BITS_PER_CHAR
-        self.logger.debug(
-            "measured line rate",
-            chars=seen,
-            span=round(span, 4),
-            baud=round(baud),
-        )
-        return baud
+        return seen / span * self.BITS_PER_CHAR
 
     # Standard serial rates.  A measurement lands a few percent off, so it
     # is snapped to the nearest of these -- both to report something
