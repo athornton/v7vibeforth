@@ -78,6 +78,12 @@ typedef short cell;		/* 16 bits on the PDP-11 and on modern gcc */
 #define P_ROT   24
 #define P_QDUP  25
 #define P_DEPTH 26
+/* double-cell stack words (Forth-79 11.1, Double Number word set).
+   16-19 were free; kept beside the single-cell group they mirror. */
+#define P_2DUP  16
+#define P_2DROP 17
+#define P_2SWAP 18
+#define P_2OVER 19
 #define P_TOR   27
 #define P_FROMR 28
 #define P_RAT   29
@@ -821,7 +827,7 @@ execute(x)
 int x;
 {
 	int pr, n, i, len;
-	cell a, b, c;
+	cell a, b, c, d;		/* d: 4th cell, for 2SWAP/2OVER */
 	int save_ip;
 	unsigned ua, ub;		/* for unsigned ops (U< U. U* U/) */
 	long la, lb;			/* for double-number ops */
@@ -918,6 +924,31 @@ int x;
 			break;
 		case P_QDUP:
 			a = pop(); push(a); if (a) push(a);
+			break;
+		/* Double-cell stack words (Forth-79 11.1).  A double lives as
+		   two cells with the LOW cell pushed first, so the high cell is
+		   on top -- see dpush()/dpop().  "Duplicate the top double" is
+		   therefore the same as "copy the top two cells, in order",
+		   which is why later standards define these on cell pairs.
+		   Written with pop/push rather than poking dstack[] directly so
+		   they inherit pop()'s underflow guard. */
+		case P_2DUP:		/* d -- d d      ( lo hi -- lo hi lo hi ) */
+			b = pop(); a = pop();
+			push(a); push(b); push(a); push(b);
+			break;
+		case P_2DROP:		/* d --          ( lo hi -- ) */
+			pop(); pop();
+			break;
+		case P_2SWAP:		/* d1 d2 -- d2 d1 */
+			d = pop(); c = pop();	/* d2 = c,d */
+			b = pop(); a = pop();	/* d1 = a,b */
+			push(c); push(d); push(a); push(b);
+			break;
+		case P_2OVER:		/* d1 d2 -- d1 d2 d1 */
+			d = pop(); c = pop();
+			b = pop(); a = pop();
+			push(a); push(b); push(c); push(d);
+			push(a); push(b);
 			break;
 		case P_DEPTH:
 			push(dsp);
@@ -1733,6 +1764,16 @@ init()
 	prim("ROT", P_ROT);
 	prim("?DUP", P_QDUP);
 	prim("DEPTH", P_DEPTH);
+	/* Double Number word set (Forth-79 section 11.1, an EXTENSION set --
+	   the Required set has no double-cell stack words).  Tagged D_COMMON
+	   rather than D_F79 deliberately: Forth-77 has no such words at all,
+	   so flagging them 79-only would make `-s 77` warn about words that
+	   no Forth-77 program could have been using in the first place, and
+	   this interpreter is lenient by design. */
+	prim("2DUP", P_2DUP);
+	prim("2DROP", P_2DROP);
+	prim("2SWAP", P_2SWAP);
+	prim("2OVER", P_2OVER);
 	prim(">R", P_TOR);
 	prim("R>", P_FROMR);
 	prim("R@", P_RAT);
