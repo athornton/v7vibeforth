@@ -19,6 +19,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
 import rich
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -56,6 +57,7 @@ async def connect_to(srv: V7Server, **kwargs: object) -> V7:
 # --------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_login_succeeds() -> None:
     """The client must get through the fixture's login sequence."""
     async with V7Server(char_delay=0) as srv:
@@ -65,6 +67,7 @@ async def test_login_succeeds() -> None:
         await v.close()
 
 
+@pytest.mark.asyncio
 async def test_login_rejects_bad_password() -> None:
     """A wrong password must NOT produce a logged-in session."""
     async with V7Server(char_delay=0) as srv:
@@ -80,6 +83,7 @@ async def test_login_rejects_bad_password() -> None:
         )
 
 
+@pytest.mark.asyncio
 async def test_cat_exits_zero_on_missing_file() -> None:
     """v7's cat prints an error but STILL EXITS 0.  This is the quirk."""
     async with V7Server(char_delay=0) as srv:
@@ -93,6 +97,7 @@ async def test_cat_exits_zero_on_missing_file() -> None:
         await v.close()
 
 
+@pytest.mark.asyncio
 async def test_test_f_reports_correctly() -> None:
     """`test -f` is the reliable existence check, unlike cat."""
     async with V7Server(files={"real": "x\n"}, char_delay=0) as srv:
@@ -104,6 +109,7 @@ async def test_test_f_reports_correctly() -> None:
         await v.close()
 
 
+@pytest.mark.asyncio
 async def test_echo_resets_status_but_assignment_does_not() -> None:
     """$? is the PREVIOUS command's status; echo clobbers it, s=$? saves it."""
     async with V7Server(char_delay=0) as srv:
@@ -117,6 +123,7 @@ async def test_echo_resets_status_but_assignment_does_not() -> None:
         await v.close()
 
 
+@pytest.mark.asyncio
 async def test_sum_matches_v7sum_and_format() -> None:
     """`sum` output must match v7's real column layout and algorithm."""
     body = "hello world\n"
@@ -129,6 +136,7 @@ async def test_sum_matches_v7sum_and_format() -> None:
         await v.close()
 
 
+@pytest.mark.asyncio
 async def test_error_wording_matches_v7() -> None:
     """v7 is inconsistent: sum says "Can't", wc says "can't"."""
     async with V7Server(char_delay=0) as srv:
@@ -146,6 +154,7 @@ async def test_error_wording_matches_v7() -> None:
         await v.close()
 
 
+@pytest.mark.asyncio
 async def test_output_is_paced_one_byte_at_a_time() -> None:
     """The whole point of the fixture: reads must return single bytes.
 
@@ -175,6 +184,7 @@ async def test_output_is_paced_one_byte_at_a_time() -> None:
         await v.close()
 
 
+@pytest.mark.asyncio
 async def test_redirection_and_append() -> None:
     """put_verified reassembles chunks with `cat a > b` and `cat c >> b`."""
     async with V7Server(char_delay=0) as srv:
@@ -197,6 +207,7 @@ async def test_redirection_and_append() -> None:
         await v.close()
 
 
+@pytest.mark.asyncio
 async def test_cmd_survives_prompt_inside_data() -> None:
     """End to end over a real socket: the original bug must stay fixed."""
     async with V7Server(files={"tricky.c": TRICKY}) as srv:
@@ -213,6 +224,7 @@ async def test_cmd_survives_prompt_inside_data() -> None:
         await v.close()
 
 
+@pytest.mark.asyncio
 async def test_fetch_roundtrip_over_socket() -> None:
     """_fetch() must return a file containing both '$ ' and 'not found'."""
     async with V7Server(files={"tricky.c": TRICKY}) as srv:
@@ -229,6 +241,7 @@ async def test_fetch_roundtrip_over_socket() -> None:
         await v.close()
 
 
+@pytest.mark.asyncio
 async def test_put_verified_roundtrip() -> None:
     """The sum-verified upload path, end to end against the fixture."""
     async with V7Server(char_delay=0) as srv:

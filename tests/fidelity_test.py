@@ -30,6 +30,7 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
 import rich
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -120,6 +121,7 @@ async def against_real(
     return None
 
 
+@pytest.mark.asyncio
 async def test_fake_matches_real() -> None:
     """Every probe must produce identical output on both systems."""
     target = real_target()

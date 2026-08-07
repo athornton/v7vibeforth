@@ -58,7 +58,8 @@ typing = [
 dev = [
     "nox",
     "nox-uv",
-    "pytest"
+    "pytest",
+    "pytest-asyncio"
 ]
 
 [tool.black]

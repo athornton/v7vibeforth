@@ -22,6 +22,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
 import rich
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -144,6 +145,7 @@ def make_v7(files: dict[str, str] | None = None) -> tuple[V7, FakeV7]:
 # --------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_plain_command_still_works() -> None:
     """A command with no '$ ' in its output must be unaffected."""
     v, _ = make_v7({})
@@ -151,6 +153,7 @@ async def test_plain_command_still_works() -> None:
     assert "hello" in out, f"lost the output: {out!r}"
 
 
+@pytest.mark.asyncio
 async def test_output_containing_prompt_is_not_truncated() -> None:
     """The reported bug: '$ ' inside the DATA ended the command early."""
     v, _ = make_v7()
@@ -161,6 +164,7 @@ async def test_output_containing_prompt_is_not_truncated() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_no_residue_leaks_into_the_next_command() -> None:
     """The second half of the bug: leftovers surfacing as later output."""
     v, _ = make_v7()
@@ -174,6 +178,7 @@ async def test_no_residue_leaks_into_the_next_command() -> None:
         )
 
 
+@pytest.mark.asyncio
 async def test_file_without_trailing_newline() -> None:
     """The marker must not be mistaken for file content when they join."""
     v, _ = make_v7({"nonl": NO_NEWLINE})
@@ -184,6 +189,7 @@ async def test_file_without_trailing_newline() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_fetch_roundtrips_a_file_containing_a_prompt() -> None:
     """_fetch() (the 'get' verb) must return the file byte-for-byte."""
     v, _ = make_v7()
@@ -195,6 +201,7 @@ async def test_fetch_roundtrips_a_file_containing_a_prompt() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_fetch_of_missing_file_returns_none() -> None:
     """A genuinely absent file must still be reported as a failure."""
     v, _ = make_v7({})
@@ -203,6 +210,7 @@ async def test_fetch_of_missing_file_returns_none() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_fetch_file_containing_error_text() -> None:
     """A file whose CONTENTS mention 'not found' must download fine.
 
