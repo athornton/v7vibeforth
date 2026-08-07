@@ -14,6 +14,7 @@ init:
 	uv pip install --upgrade uv || pip install --upgrade uv
 	uv sync --frozen --all-groups
 	uv run prek install
+	uv pip install -e . --group=dev
 
 .PHONY: update
 update: update-deps init
