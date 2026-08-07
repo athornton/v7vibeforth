@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import shlex
 from dataclasses import dataclass
 from getpass import getpass
@@ -127,6 +128,7 @@ class V7:
         port: int | None = None,
         *,
         debug: bool = False,
+        baud: float | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -137,9 +139,30 @@ class V7:
         self.writer: telnetlib3.TelnetWriter | None = None
         self.buf = ""
         self._seq = 0  # serial number for cmd()'s framing marker
+        # Line speed in bits/sec.  If given, it is taken as gospel and no
+        # measurement happens; otherwise connect() measures it (see
+        # measure_line_rate) and every pacing delay is derived from it.
+        self.baud: float | None = baud
+        self._baud_pinned = baud is not None
         self.logger = structlog.get_logger()
         self._set_debug_log()
         self.logger.debug("v7 instance initialized")
+
+    # A character on an 8N1 serial line costs ten bit-times: eight data
+    # bits plus a start and a stop bit.
+    BITS_PER_CHAR: ClassVar[int] = 10
+
+    # Used until a measurement lands, and if measurement fails.  300 baud
+    # is the slowest thing this tool talks to (simh's console and DC11), so
+    # it is the safe assumption: too-slow merely wastes time, while
+    # too-fast overruns the tty input queue and corrupts an upload.
+    FALLBACK_BAUD: ClassVar[float] = 300.0
+
+    @property
+    def char_time(self) -> float:
+        """Seconds one character occupies on the wire."""
+        baud = self.baud or self.FALLBACK_BAUD
+        return self.BITS_PER_CHAR / baud
 
     def _set_debug_log(self) -> None:
         if self.debug:
@@ -176,6 +199,21 @@ class V7:
         structlog.contextvars.bind_contextvars(host=self.host)
         structlog.contextvars.bind_contextvars(port=self.port)
         structlog.contextvars.bind_contextvars(user=self.user)
+        # Now that there is a shell, find out how fast the line really is,
+        # so every pacing delay can be derived from it instead of assuming
+        # the 300-baud DC11 this tool was first written for.  An explicit
+        # baud= wins; a failed measurement leaves the previous value.
+        if not self._baud_pinned:
+            measured = await self.measure_line_rate()
+            if measured is not None:
+                self.baud = self.snap_baud(measured)
+                structlog.contextvars.bind_contextvars(baud=self.baud)
+                self.logger.debug(
+                    "line rate set",
+                    measured=round(measured),
+                    baud=self.baud,
+                    char_ms=round(self.char_time * 1000, 3),
+                )
 
     async def _pump(self, tmout: float) -> str:
         if self.reader is None:
@@ -240,15 +278,157 @@ class V7:
             # instantly and spin the loop until the deadline.
             await self._pump(min(2.0, max(0.05, end - loop.time())))
 
-    async def send_slow(self, st: str, delay: float = 0.04) -> None:
-        """Send a string character-by-character with a delay between each."""
+    async def send_slow(self, st: str, delay: float | None = None) -> None:
+        """Send a string character-by-character with a delay between each.
+
+        `delay` defaults to one character time at the measured line speed,
+        so this paces itself to whatever is on the other end instead of
+        assuming a 300-baud DC11 as it used to.
+
+        DELIBERATELY still one character at a time.  Under simh a zero-delay
+        burst of a whole command line appears to work, but that proves
+        nothing: simh does not throttle TCP *input* (measured ~4500 cps
+        accepted), so the burst is absorbed by a socket buffer that no real
+        serial line has.  On actual hardware the receiver has to keep up
+        character by character -- a DZ11's silo is small and shared between
+        its lines, and period UARTs were worse still (the 8250 and even the
+        faster 16450 had a ONE-byte receive buffer; no FIFO until the
+        16550).  There is no flow control in this path either: no RTS/CTS,
+        no XON/XOFF.  An overrun therefore does not raise an error, it
+        silently eats characters -- which is the failure this project
+        already hit, and the reason put_verified checksums every chunk.
+        So: pace to the line, and let the checksum catch what slips.
+        """
         if self.writer is None:
             self._write_error()
             return
+        if delay is None:
+            delay = self.char_time
         for ch in st:
             self.writer.write(ch)
             await self.writer.drain()
-            await asyncio.sleep(delay)
+            if delay:
+                await asyncio.sleep(delay)
+
+    # Probe for measure_line_rate.  Long enough for a stable estimate
+    # (measured spread: 16% at 60 chars, 3.5% at 100) and short enough to
+    # be cheap -- 100 characters is ~0.11 s at 9600 baud, ~3.3 s at 300.
+    PROBE_CHARS: ClassVar[int] = 100
+
+    async def measure_line_rate(self) -> float | None:
+        """Time a known-length reply to derive the line speed, in baud.
+
+        Telnet cannot tell us this.  RFC 1079 TSPEED is a *client's* hint
+        about its own terminal, and simh does not negotiate it at all: it
+        offers only LINEMODE, SGA, ECHO and BINARY (verified against the
+        real machine), so `get_extra_info('speed')` is None.  The line
+        speed is a property of the emulated DZ11/DC11 inside simh, which
+        nobody advertises.
+
+        But it is directly observable.  The host is ~1000x faster than the
+        line, so output arrives one character at a time, each one costing a
+        full character time on the wire -- measured median inter-byte gap
+        on the 9600-baud DZ11 was 1.027 ms against a theoretical 1.042 ms.
+        Timing a reply of known length therefore recovers the rate to a few
+        percent, and works on anything from a 300-baud console to a real
+        PDP-11 behind a serial gateway.
+
+        Returns the estimate in baud, or None if it could not be measured
+        (in which case self.baud is left alone).
+        """
+        if self.writer is None:
+            self._write_error()
+            return None
+        payload = "x" * self.PROBE_CHARS
+        self.buf = ""
+        # Send with no pacing: we are timing the RECEIVE side, and a probe
+        # is a single short line that the tty queue swallows comfortably.
+        await self.send_slow(f"echo {payload}\r", 0.0)
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 30.0
+        # Start the clock at the FIRST byte back, not at the send: what
+        # comes before that is the round trip and the shell's own latency,
+        # neither of which is the line rate.
+        first: float | None = None
+        seen = 0
+        while seen < self.PROBE_CHARS and loop.time() < deadline:
+            got = await self._pump(2.0)
+            if not got:
+                break
+            if first is None:
+                first = loop.time()
+                # Don't count the first read: its arrival time is what we
+                # are measuring from, so it has no gap in front of it.
+                got = got[1:]
+            seen += len(got)
+        span = loop.time() - first if first is not None else 0.0
+        # Drain the prompt so the next command starts from a clean line.
+        await self._drain(0.4, 5.0)
+        self.buf = ""
+        if seen < self.PROBE_CHARS // 2 or span <= 0:
+            self.logger.warning(
+                "could not measure line rate; keeping current value",
+                chars=seen,
+                span=round(span, 4),
+                baud=self.baud,
+            )
+            return None
+        baud = seen / span * self.BITS_PER_CHAR
+        self.logger.debug(
+            "measured line rate",
+            chars=seen,
+            span=round(span, 4),
+            baud=round(baud),
+        )
+        return baud
+
+    # Standard serial rates.  A measurement lands a few percent off, so it
+    # is snapped to the nearest of these -- both to report something
+    # recognisable and so pacing is derived from the rate the hardware is
+    # actually running at.
+    STANDARD_BAUD: ClassVar[tuple[float, ...]] = (
+        75.0,
+        110.0,
+        150.0,
+        300.0,
+        600.0,
+        1200.0,
+        1800.0,
+        2400.0,
+        4800.0,
+        9600.0,
+        19200.0,
+        38400.0,
+    )
+
+    # How far a measurement may sit from a standard rate and still snap to
+    # it, as a ratio.  Most of the standard rates are an OCTAVE apart
+    # (300/600/1200, 2400/4800/9600/19200), so the midpoint between two
+    # neighbours is sqrt(2) = 1.414x away from both; a window smaller than
+    # that leaves a dead band where a real rate fails to snap.  sqrt(2) is
+    # therefore the natural choice: every point between two octave-spaced
+    # rates belongs to one of them, and nothing is left stranded.
+    SNAP_WINDOW: ClassVar[float] = math.sqrt(2.0)
+
+    @classmethod
+    def snap_baud(cls, baud: float) -> float:
+        """Snap a measured rate to the nearest standard serial speed.
+
+        Compared in log space, so "nearest" means nearest by ratio: 9737
+        lands on 9600 rather than being pulled toward 19200 by raw distance,
+        and 3684 (measured on a real 4800-baud line, 23% low) lands on 4800
+        rather than falling into a gap.
+
+        A measurement further than SNAP_WINDOW from every standard rate is
+        returned unchanged -- better an honest odd number than a confident
+        wrong one.
+        """
+        if baud <= 0:
+            return baud
+        best = min(cls.STANDARD_BAUD, key=lambda s: abs(math.log(baud / s)))
+        if abs(math.log(baud / best)) > math.log(cls.SNAP_WINDOW):
+            return baud
+        return best
 
     async def _login(self) -> str | None:
         """Log in to remote v7 system."""
@@ -352,22 +532,28 @@ class V7:
         remote: str,
         content: str,
         *,
-        pace: float = 0.035,
+        pace: float | None = None,
         verify: bool = True,
     ) -> bool | dict[str, str | int]:
         """Upload text to `remote` via ed-free cat, line by line.
 
         Each physical line is sent then we wait to see its echo (the trailing
         newline) before sending the next, so the tty queue never overflows.
+        `pace` is the per-character delay; None derives it from the measured
+        line speed.  put_verified() is the faster path -- this one is kept
+        for the pathologically slow case, where one character at a time with
+        an echo check after every line is the only thing that survives.
         """
         if self.writer is None:
             self._write_error()
             return False
+        if pace is None:
+            pace = self.char_time
         if not content.endswith("\n"):
             content += "\n"
         lines = content.split("\n")[:-1]  # drop final empty
         self.buf = ""
-        await self.send_slow("cat > " + remote + "\n", 0.04)
+        await self.send_slow("cat > " + remote + "\n")
         await asyncio.sleep(0.6)
         self.buf = ""
         for ln in lines:
@@ -440,30 +626,51 @@ class V7:
         await self.connect()
         return True
 
+    def line_pace(self, line: str) -> float:
+        """How long to wait after bursting `line` into a `cat > file`.
+
+        The tty has to echo every character back, and the echo is what
+        actually costs time: writing a 60-character line takes no time at
+        all locally, but the far end needs 60 character times to echo it.
+        Waiting less means the echo backs up in the tty queue and, under
+        sustained load, the line drops mid-upload.  So the pause scales
+        with the line's LENGTH, not with a fixed constant -- which is what
+        made the old hardcoded 0.02 s wrong at any speed but 9600.
+        """
+        return len(line) * self.char_time * self.ECHO_HEADROOM
+
+    # How much of the echo time to actually wait.  1.0 would be exact; less
+    # relies on the tty queue absorbing the slack (it holds a few hundred
+    # characters).  0.5 was measured to be reliable at 9600 while running
+    # about twice as fast as waiting for the full echo.
+    ECHO_HEADROOM: ClassVar[float] = 0.5
+
     async def _cat_chunk(
-        self, remote: str, lines: list[str], pace: float
+        self, remote: str, lines: list[str], pace: float | None = None
     ) -> None:
         """Cat > remote, ECHO ON, whole lines burst out with a tiny pause.
 
-        On the DZ11 at 9600 the echo return keeps up, so we send each line
-        in one write and pause only `pace` seconds between lines, draining
-        echo as we go (measured ~25000 cps lossless).  Short lines keep the
-        tty canonical input queue from overflowing; the caller's maxlen
-        guard enforces that.  For the old 300-baud DC11 raise `pace`.
+        Each line goes out in one write, then we pause long enough for the
+        far end to echo it and drain that echo, keeping the tty's canonical
+        input queue clear.  With `pace=None` the pause is derived from the
+        measured line speed and the line's length (see line_pace); pass a
+        number to override it.  Short lines matter too -- the caller's
+        maxlen guard enforces that.
         """
         if self.writer is None:
             self._write_error()
             return
         self.buf = ""
         self.logger.debug("_cat_chunk: sending chunk", chunk=f"'{remote}'")
-        await self.send_slow("cat > " + remote + "\n", 0.01)
+        await self.send_slow("cat > " + remote + "\n")
         await asyncio.sleep(0.3)
         self.buf = ""
         for ln in lines:
             self.writer.write(ln + "\n")  # whole line in one burst
             await self.writer.drain()
-            if pace:
-                await asyncio.sleep(pace)
+            delay = self.line_pace(ln) if pace is None else pace
+            if delay:
+                await asyncio.sleep(delay)
             await self._pump(0.3)  # drain echo, keep queue clear
             if "login:" in self.buf:  # session dropped mid-upload!
                 self.logger.error(
@@ -499,19 +706,21 @@ class V7:
         content: str,
         *,
         chunk_lines: int = 60,
-        pace: float = 0.02,
+        pace: float | None = None,
         tries: int = 4,
         maxlen: int = 100,
     ) -> bool:
         """Upload in sum-verified chunks (echo on, whole-line bursts),
         retrying any failed chunk, then concatenate into `remote`.
 
-        Tuned for the DZ11 at 9600: full forth.c (~32KB) in ~90s vs ~14min
-        on the old 300-baud char-paced path.  We can't go much faster --
-        the DZ11 has no DMA, so the single-core simulator services every
-        char and the telnet line DROPS under sustained faster bursts (hence
-        the conservative pace and _resync's reconnect-on-drop).  `maxlen`
-        guards the tty canonical input-queue limit.
+        With `pace=None` the inter-line pause is derived from the measured
+        line speed, so this runs at whatever the far end can take: full
+        forth.c (~32KB) in ~90s on the 9600-baud DZ11, and correctly slower
+        on a 300-baud console instead of corrupting the upload.  We can't go
+        much faster than the line -- the DZ11 has no DMA, so the
+        single-core simulator services every char and the telnet line DROPS
+        under sustained faster bursts (hence _resync's reconnect-on-drop).
+        `maxlen` guards the tty canonical input-queue limit.
         """
         if not content.endswith("\n"):
             content += "\n"
@@ -562,11 +771,16 @@ class V7:
                     ok = True
                     break
                 # recover: reconnect if the line died, clear residue, and
-                # back off the pace a little -- the drop is load/timing
-                # sensitive, so a slower retry usually goes through.
+                # back off the pace -- the drop is load/timing sensitive, so
+                # a slower retry usually goes through.  Multiplicative, so
+                # it stays meaningful whether the pace came from the
+                # measured line rate or was passed in: adding a flat 20 ms
+                # would be a rounding error at 300 baud and a doubling at
+                # 9600.  Capped so a pathological line cannot stall for ever.
                 await self._resync()
                 self.buf = ""
-                cpace = min(cpace + 0.02, 0.12)
+                base = self.line_pace("x" * maxlen) if cpace is None else cpace
+                cpace = min(base * 2, 0.12)
             if not ok:
                 self.logger.error(
                     f"  giving up on chunk {ci + 1} after {tries} tries"
@@ -839,7 +1053,13 @@ class V7:
                     db = ""
                     if self.debug:
                         db = "[blue]debug"
-                    status = f"{self.user}@{self.host}:{self.port} {cn} {db}"
+                    bd = ""
+                    if self.baud:
+                        how = "pinned" if self._baud_pinned else "measured"
+                        bd = f"[cyan]{self.baud:g} baud ({how})"
+                    status = (
+                        f"{self.user}@{self.host}:{self.port} {cn} {db} {bd}"
+                    )
                     rich.print(status)
                 case "local_sum":
                     content = self._read_path(toks[0])
