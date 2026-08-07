@@ -4,7 +4,7 @@ import nox
 from nox_uv import session
 
 # Default sessions.
-nox.options.sessions = ["lint", "typing", "test", "docs"]
+nox.options.sessions = ["lint", "typing", "test"]
 
 # Other nox defaults.
 nox.options.default_venv_backend = "uv"
@@ -26,3 +26,9 @@ def typing(session: nox.Session) -> None:
         "noxfile.py",
         "src",
     )
+
+
+@session(uv_groups=["dev", "nox"])
+def test(session: nox.Session) -> None:
+    """Run tests."""
+    session.run("pytest", "-vvv", *session.posargs)

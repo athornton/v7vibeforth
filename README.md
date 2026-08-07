@@ -1,6 +1,6 @@
 # Vibe-coded Unix v7 Forth interpreter and file transfer tool
 
-Claude (Opus 4.8) did most of the work.
+Claude (Opus 4.8 and Opus 5.0) did most of the work.
 
 I have wanted a Forth interpreter on Unix v7 for a while now.
 

@@ -17,7 +17,7 @@ classifiers = [
     "Private :: Do Not Upload",
     "Typing :: Typed",
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "rich",
     "structlog",
@@ -54,6 +54,12 @@ nox = [
 ]
 typing = [
     "mypy>=1.19"
+]
+dev = [
+    "nox",
+    "nox-uv",
+    "pytest",
+    "pytest-asyncio"
 ]
 
 [tool.black]
@@ -119,6 +125,11 @@ extend = "ruff-shared.toml"
 [tool.ruff.lint.extend-per-file-ignores]
 "*/noxfile.py" = [
     "INP001",  # subdirectory nox configuration isn't in a package
+]
+"tests/**" = [
+    "BLE001",  # the standalone runner reports any test error, not just ours
+    "E402",    # sys.path must be set up before importing v7
+    "INP001",  # tests are run directly, not imported as a package
 ]
 "src/v7/v7.py" = [
     "C901",     # There are indeed some complex methods.
