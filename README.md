@@ -202,9 +202,10 @@ The file can be a maximum of 32 1024-character blocks, and will always be a mult
 I offered surprisingly (to me) minimal guidance to Claude: basically not much more setting up the v7 system and telling it, "here's how you log in; it's a standard Unix v7 system with C as described in First Edition K&R, and I want a threaded Forth interpreter written in that C that compiles, runs, and passes its tests on the emulated system."
 
 That got a working interpreter; after that I asked Claude to make it compliant with the [Forth-77](https://www.complang.tuwien.ac.at/forth/forth-77.txt) and [Forth-79](https://6502.org/documents/books/forth_interest_group/forth_79_standard.pdf) standards (with a switch between the two, and lenient about what it accepted).
-What we have now is [forth.c](./c/forth.c), an interpreter (maybe; I haven't actually verified more than it behaves like I think a Forth interpreter should) compliant with both standards, including block storage.
+Then I requested a test suite for all of the built-in words.
+What we have now is [forth.c](./c/forth.c), an interpreter (maybe; I haven't actually verified the accuracy of all the tests) compliant with both standards, including block storage.
 
-It's neither brilliant nor elegant, but it appears functional; forth.c is now 48362 bytes, compiling (with -O, stripped) to 15394 bytes.
+It's neither brilliant nor elegant, but it appears functional; forth.c is now 50088 bytes, compiling (with -O, stripped) to 15596 bytes.
 That's large in v7 terms:
 
 | Program | Size (bytes) |
@@ -244,26 +245,25 @@ Brian Kernighan probably disagrees.
 Along the way, Claude realized it needed a way to transfer files into and out of the v7 system.
 It came up with an early version of [v7](./v7.py).
 Initially this was set for 300 bps (the speed you get from the emulated DC11 and the console in simh), but after I got the DZ11 up and running, it was changed to work at 9600bps.
+Later, Claude added dynamic line rate detection.
 
 I realized that `v7` would be much more helpful to me if I put an interactive mode into it, so I did.
 
 I also added ubiquitous type hinting and made it happy with the `ruff` rules we use at work.
 
 This program was much more of a collaboration between myself and Claude.
-The core of the character-by-character delayed upload is Claude's; all of the interactive features and working retry logic are mine.
-
-Yes, I'm aware it still needs a test suite.
-Maybe I'll get there.
-I have an idea for mocking a v7 machine using the server side of `telnetlib3` but that's going to be a bunch of work, and given how much Claude costs to use (see below) I don't necessarily want it to construct that for me.
+The core of the character-by-character delayed upload is Claude's; all of the interactive features are mine.
 
 It is my hope that fellow retrocomputing enthusiasts will find [v7](src/v7/v7.py) to be useful for getting files into and out of emulators when all you have is a terminal or console connection.
 
 Of course, that's not the only way to get files in and out of v7 Unix.
+Some terminal emulators, including the one I use, [iTerm2](https://iterm2.com), have a "slow paste" mode so you can just start catting to a file, slow-paste the contents, and then hit Control-D.
+In essence, that's all that `v7` does.
 On my emulated system at home I've implemented [uucp](https://en.wikipedia.org/wiki/UUCP) for period-correct pre-TCP/IP file transfer over an 8-bit-clean DZ-11 (this is probably the best solution, but it is far more complex than what is presented here).
 The `uucp` implementation doesn't offer a lot of feedback, so debugging dropped connections is actually much harder than with the `v7` tool.
 
 If you want to edit in-situ on the v7 system, there's `ed` (ugh, but it [is the standard editor](https://www.gnu.org/fun/jokes/ed-msg.html) or you can add `s` [re-modified to work on v7](https://github.com/athornton/s/tree/v7) and get something kind of like vi.
-Finally, some terminal emulators, including the one I use, [iTerm2](https://iterm2.com), have a "slow paste" mode so you can just start catting to a file, slow-paste the contents, and then hit Control-D.
+For non-interactive editing, you have `sed` and `awk`, which might be more pleasant to use than `ed`.
 
 ## Notes
 
@@ -300,9 +300,9 @@ In several instances it was easier for me to tell Claude "the detail about this 
 Given how fast Claude burned through tokens, I'm pretty sure it was costing a higher hourly rate than a junior developer, and the code it produced was at best junior-developer-level quality.
 However, I'm not going to find any junior developers who know how to write 1979-era K&R C at all fluently, and it was much better at taking existing patterns (e.g. "Here's how to write a simple screen editor with raw VT100 control codes") and applying them than a human junior developer would have been.
 
-Along the way, Claude went down some weird rabbit holes, like deciding that overrunning the telnet buffer on v7 had something to do with tab expansion (it didn't), or its frankly insane attempt at reconnection after the telnet session dropped.
+Along the way, Claude went down some weird rabbit holes, like deciding that overrunning the telnet buffer on v7 had something to do with tab expansion (it didn't), or its first, frankly insane, attempt at reconnection after the telnet session dropped.
 I spent quite some time staring at that and trying to understand it before deciding it was fundamentally broken and reimplementing it in a straightforward and much easier way.
-(The trick was to create the sentinel out of two separate short echo statements, so that the string you were looking for was not in the command you just sent.)
+(The trick was to create the sentinel out of two separate short echo statements, so that the string you were looking for could not be in the command you just sent.)
 
 ## Conclusions
 
@@ -320,6 +320,7 @@ Do you want it to do one-off jigs and scaffolds to build something you want done
 Did it take less effort to have Claude write the interpreter and editor, and guide it through the process, than it would have for me to do the same?
 
 *Probably.*
+If you count the effort of implementing a thorough test suite, *Definitely*.
 
 Would I have lost interest partway through one or both of those tasks and put the project aside never to be completed?
 
