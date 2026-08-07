@@ -147,3 +147,6 @@ dmypy.json
 # built binaries
 bedit
 forth
+
+# forth buffers
+blocks
