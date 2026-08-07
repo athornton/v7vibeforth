@@ -59,7 +59,8 @@ dev = [
     "nox",
     "nox-uv",
     "pytest",
-    "pytest-asyncio"
+    "pytest-asyncio",
+    "scriv"
 ]
 
 [tool.black]
