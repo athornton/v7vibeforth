@@ -8,9 +8,13 @@ what was actually observed on the real machine.
 
 Every expected string below was captured from the real v7 under simh.
 
+These are the FIXTURE's own tests: v7 shell semantics, login, pacing.  The
+end-to-end tests of v7.py's behaviour against this fixture live in
+cmd_test.py; anything asserted there is deliberately not repeated here.
+
 Runnable two ways:
     python tests/v7server_test.py     (no pytest needed)
-    pytest tests/v7server_test.py     (once pytest-asyncio is a dep)
+    pytest tests/v7server_test.py
 """
 
 from __future__ import annotations
@@ -25,18 +29,9 @@ import rich
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from support.v7server import V7Server
+from support.v7server import V7Server, logged_in
 
 from v7.v7 import V7, v7sum
-
-# Contains '$ ' (the shell prompt) AND 'not found' -- the two strings that
-# each broke a different piece of v7.py.
-TRICKY = """\
-/* mv_eol: last non-space column */
-/* $ : go to end of line */
-strc(msg, "not found");
-LAST
-"""
 
 
 async def connect_to(srv: V7Server, **kwargs: object) -> V7:
@@ -86,61 +81,53 @@ async def test_login_rejects_bad_password() -> None:
 @pytest.mark.asyncio
 async def test_cat_exits_zero_on_missing_file() -> None:
     """v7's cat prints an error but STILL EXITS 0.  This is the quirk."""
-    async with V7Server(char_delay=0) as srv:
-        v = await connect_to(srv)
+    async with logged_in(char_delay=0) as (v, _):
         out = await v.cmd("cat /nosuchfile; echo rc$?", timeout=15)
         assert "can't open /nosuchfile" in out, f"no error text: {out!r}"
         assert "rc0" in out, (
             "fixture made cat exit nonzero; the real v7 exits 0, and "
             f"modelling it wrongly is what hid the bug before: {out!r}"
         )
-        await v.close()
 
 
 @pytest.mark.asyncio
 async def test_test_f_reports_correctly() -> None:
     """`test -f` is the reliable existence check, unlike cat."""
-    async with V7Server(files={"real": "x\n"}, char_delay=0) as srv:
-        v = await connect_to(srv)
+    async with logged_in({"real": "x\n"}, char_delay=0) as (v, _):
         out = await v.cmd("test -f real; echo rc$?", timeout=15)
         assert "rc0" in out, f"test -f on an existing file: {out!r}"
         out = await v.cmd("test -f nope; echo rc$?", timeout=15)
         assert "rc1" in out, f"test -f on a missing file: {out!r}"
-        await v.close()
 
 
 @pytest.mark.asyncio
 async def test_echo_resets_status_but_assignment_does_not() -> None:
     """$? is the PREVIOUS command's status; echo clobbers it, s=$? saves it."""
-    async with V7Server(char_delay=0) as srv:
-        v = await connect_to(srv)
+    async with logged_in(char_delay=0) as (v, _):
         # Without stashing, the intervening echo resets $? to 0.
         out = await v.cmd("false; echo -n MK; echo rc$?", timeout=15)
         assert "MKrc0" in out, f"echo should have reset $? to 0: {out!r}"
         # Stashing first preserves it.
         out = await v.cmd("false; s=$?; echo -n MK; echo rc$s", timeout=15)
         assert "MKrc1" in out, f"s=$? should have preserved 1: {out!r}"
-        await v.close()
 
 
 @pytest.mark.asyncio
 async def test_sum_matches_v7sum_and_format() -> None:
     """`sum` output must match v7's real column layout and algorithm."""
     body = "hello world\n"
-    async with V7Server(files={"f": body}, char_delay=0) as srv:
-        v = await connect_to(srv)
+    async with logged_in({"f": body}, char_delay=0) as (v, _):
         out = await v.cmd("sum f", timeout=15)
         want, blocks = v7sum(body.encode())
-        assert str(want) in out, f"sum {want} not in {out!r}"
-        assert str(blocks) in out, f"block count {blocks} not in {out!r}"
-        await v.close()
+        assert f"{want:d}{blocks:6d}" in out, (
+            f"sum column layout wrong; real v7 prints '%u%6u': {out!r}"
+        )
 
 
 @pytest.mark.asyncio
 async def test_error_wording_matches_v7() -> None:
     """v7 is inconsistent: sum says "Can't", wc says "can't"."""
-    async with V7Server(char_delay=0) as srv:
-        v = await connect_to(srv)
+    async with logged_in(char_delay=0) as (v, _):
         out = await v.cmd("sum /nope", timeout=15)
         assert "sum: Can't open /nope" in out, (
             f"sum uses a capital C on real v7: {out!r}"
@@ -151,7 +138,6 @@ async def test_error_wording_matches_v7() -> None:
         )
         out = await v.cmd("frobnicate", timeout=15)
         assert "frobnicate: not found" in out, f"unknown command: {out!r}"
-        await v.close()
 
 
 @pytest.mark.asyncio
@@ -161,8 +147,7 @@ async def test_output_is_paced_one_byte_at_a_time() -> None:
     If this fails, the suite can no longer catch end-of-output framing bugs,
     because on the real 9600-baud line 28910 of 28914 reads are 1 byte.
     """
-    async with V7Server(files={"f": "x" * 200 + "\n"}) as srv:
-        v = await connect_to(srv)
+    async with logged_in({"f": "x" * 200 + "\n"}) as (v, _):
         sizes: list[int] = []
         original = v._pump
 
@@ -181,14 +166,12 @@ async def test_output_is_paced_one_byte_at_a_time() -> None:
             f"{ones}/{len(sizes)} reads were a single byte, so this suite "
             "cannot reproduce the real line's framing behaviour"
         )
-        await v.close()
 
 
 @pytest.mark.asyncio
 async def test_redirection_and_append() -> None:
     """put_verified reassembles chunks with `cat a > b` and `cat c >> b`."""
-    async with V7Server(char_delay=0) as srv:
-        v = await connect_to(srv)
+    async with logged_in(char_delay=0) as (v, _):
         await v.cmd("echo one > /tmp/a", timeout=15)
         await v.cmd("echo two > /tmp/b", timeout=15)
         await v.cmd("cat /tmp/a > /tmp/c", timeout=15)
@@ -204,48 +187,32 @@ async def test_redirection_and_append() -> None:
         assert body.index("one") < body.index("two"), (
             f"append put the chunks in the wrong order: {body!r}"
         )
-        await v.close()
 
 
 @pytest.mark.asyncio
-async def test_cmd_survives_prompt_inside_data() -> None:
-    """End to end over a real socket: the original bug must stay fixed."""
-    async with V7Server(files={"tricky.c": TRICKY}) as srv:
-        v = await connect_to(srv)
-        out = await v.cmd("cat tricky.c", timeout=30)
-        assert "LAST" in out, (
-            f"output truncated at the '$ ' inside the data: {out[-40:]!r}"
-        )
-        follow = await v.cmd("echo MARKER", timeout=15)
-        assert "MARKER" in follow, f"follow-up lost its output: {follow!r}"
-        assert "mv_eol" not in follow, (
-            f"previous output leaked into the next command: {follow[:80]!r}"
-        )
-        await v.close()
+async def test_stdin_capture_reassembles_lines() -> None:
+    """`cat > f` must store what was typed, newlines and all.
 
-
-@pytest.mark.asyncio
-async def test_fetch_roundtrip_over_socket() -> None:
-    """_fetch() must return a file containing both '$ ' and 'not found'."""
-    async with V7Server(files={"tricky.c": TRICKY}) as srv:
-        v = await connect_to(srv)
-        body = await v._fetch("tricky.c")
-        assert body == TRICKY, (
-            "download mismatch\n"
-            f"  got  {len(body or 0 * '')} bytes {body!r}\n"
-            f"  want {len(TRICKY)} bytes"
+    Every upload goes through this path.  _cat_chunk sends a bare LF while
+    send_slow sends CR, so the fixture has to treat CR, LF and CRLF alike or
+    uploads silently lose every newline (which showed up as a sum mismatch,
+    not as missing data).
+    """
+    async with logged_in(char_delay=0) as (v, srv):
+        await v._cat_chunk("/tmp/chunk", ["alpha", "beta", "gamma"], 0)
+        assert srv.files.get("/tmp/chunk") == "alpha\nbeta\ngamma\n", (
+            f"stdin capture mangled the chunk: {srv.files.get('/tmp/chunk')!r}"
         )
-        assert await v._fetch("nope.c") is None, (
-            "a missing file was reported as a successful download"
-        )
-        await v.close()
 
 
 @pytest.mark.asyncio
 async def test_put_verified_roundtrip() -> None:
-    """The sum-verified upload path, end to end against the fixture."""
-    async with V7Server(char_delay=0) as srv:
-        v = await connect_to(srv)
+    """The sum-verified upload path, end to end against the fixture.
+
+    This is the one v7.py path that cannot be tested without a server
+    fixture: it interleaves upload, `sum` verification and reassembly.
+    """
+    async with logged_in(char_delay=0) as (v, srv):
         content = "".join(f"line {i}\n" for i in range(150))
         ok = await v.put_verified("out.txt", content, chunk_lines=60, pace=0)
         assert ok, "put_verified reported failure"
@@ -254,7 +221,6 @@ async def test_put_verified_roundtrip() -> None:
             f"  got  {len(srv.files.get('out.txt', ''))} bytes\n"
             f"  want {len(content)} bytes"
         )
-        await v.close()
 
 
 async def _main() -> int:

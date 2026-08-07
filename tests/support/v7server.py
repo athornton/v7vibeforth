@@ -38,10 +38,10 @@ from typing import TYPE_CHECKING, ClassVar, Self
 
 import telnetlib3
 
-from v7.v7 import v7sum
+from v7.v7 import V7, v7sum
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
 # One character at 9600 baud, 8N1 (8 data + start + stop = 10 bits).
 BAUD_9600_PER_CHAR = 10 / 9600
@@ -471,3 +471,41 @@ async def serve(
     srv = V7Server(files=dict(files or {}), **kwargs)  # type: ignore[arg-type]
     await srv.start()
     return srv
+
+
+@contextlib.asynccontextmanager
+async def logged_in(
+    files: dict[str, str] | None = None, **kwargs: object
+) -> AsyncIterator[tuple[V7, V7Server]]:
+    """Yield a (client, server) pair with the client already logged in.
+
+    Cleans up both ends on the way out, so a failing assertion cannot leak
+    a listening socket into the rest of the suite.
+
+    `send_delay` (default 0) overrides V7.send_slow's 40 ms-per-character
+    pacing.  That default exists to protect the real DZ11's tty input queue;
+    against a fixture there is no queue to overrun, and paying it would make
+    every test spend ~1.5 s per command sleeping.
+    """
+    send_delay = float(kwargs.pop("send_delay", 0.0))  # type: ignore[arg-type]
+    async with V7Server(files=dict(files or {}), **kwargs) as srv:  # type: ignore[arg-type]
+        v = V7(
+            user=srv.user,
+            password=srv.password,
+            host="127.0.0.1",
+            port=srv.port,
+        )
+        original = v.send_slow
+
+        async def quick(st: str, delay: float = send_delay) -> None:
+            await original(st, send_delay)
+
+        v.send_slow = quick  # type: ignore[method-assign]
+        await v.connect()
+        if v.writer is None:
+            msg = "client failed to log in to the fixture"
+            raise AssertionError(msg)
+        try:
+            yield v, srv
+        finally:
+            await v.close()

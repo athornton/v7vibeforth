@@ -130,6 +130,8 @@ extend = "ruff-shared.toml"
     "BLE001",  # the standalone runner reports any test error, not just ours
     "E402",    # sys.path must be set up before importing v7
     "INP001",  # tests are run directly, not imported as a package
+    "S108",    # /tmp paths live in the fixture's VIRTUAL filesystem, which
+               # never touches the real one -- same reason src/v7/v7.py does
 ]
 "src/v7/v7.py" = [
     "C901",     # There are indeed some complex methods.
